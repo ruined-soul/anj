@@ -17,7 +17,7 @@
 import asyncio
 import json
 from datetime import datetime
-from typing import Any, ClassVar, MutableMapping, Optional
+from typing import Any, ClassVar, Mapping, Optional, Set
 
 from aiopath import AsyncPath
 
@@ -28,8 +28,21 @@ class Backups(plugin.Plugin):
     name: ClassVar[str] = "Backups"
     helpable: ClassVar[bool] = True
 
-    async def on_load(self) -> None:
-        self.db = self.bot.db.get_collection("MIGRATED_BACKUPS")
+    async def propagate_event(
+        self, chat_id: int, data: Optional[Mapping[str, Any]] = None
+    ) -> Optional[Set[asyncio.Task[Mapping[str, Any]]]]:
+        event = "restore" if data else "backup"
+        params = (chat_id, data) if data else (chat_id,)
+        listener = self.bot.listeners.get(f"plugin_{event}", [])
+        if not listener:
+            return
+
+        tasks: Set[asyncio.Task[Mapping[str, Any]]] = set()
+        for lst in listener:
+            tasks.add(asyncio.create_task(lst.func(*params)))
+
+        fut, _ = await asyncio.wait(tasks)
+        return fut
 
     @command.filters(filters.admin_only)
     async def cmd_backup(self, ctx: command.Context) -> Optional[str]:
@@ -40,13 +53,13 @@ class Backups(plugin.Plugin):
 
         await ctx.respond(await self.text(chat.id, "backup-progress"))
 
-        results = await self.bot.dispatch_event("plugin_backup", chat.id)
+        results = await self.propagate_event(chat.id)
         if not results or len(results) <= 1:
             return await self.text(chat.id, "backup-null")
 
-        result: MutableMapping[str, Any]
-        for result in results:
-            data.update(result)
+        task: asyncio.Task[Mapping[str, Any]]
+        for task in results:
+            data.update(task.result())
 
         await file.write_text(json.dumps(data, indent=2))
 
@@ -81,7 +94,7 @@ class Backups(plugin.Plugin):
         file = AsyncPath(await ctx.msg.reply_to_message.download())
 
         try:
-            data: MutableMapping[str, Any] = json.loads(await file.read_text())
+            data: Mapping[str, Any] = json.loads(await file.read_text())
         except json.JSONDecodeError:
             return await self.text(chat.id, "invalid-backup-file")
 
@@ -94,12 +107,12 @@ class Backups(plugin.Plugin):
         if len(data) <= 1:
             return await self.text(chat.id, "backup-data-null")
 
-        if data.get("_migrated", False):
-            await ctx.respond(
-                await self.text(chat.id, "restore-progress") + "\nMigrate file detected..."
-            )
-            await self.db.insert_one({"chat_id": chat.id, "on": datetime.now()})
+        results = await self.propagate_event(chat.id, data)
+        for task in results:  # type: ignore
+            try:
+                task.result()
+            except KeyError:
+                continue
 
-        await self.bot.dispatch_event("plugin_restore", chat.id, data)
         await asyncio.gather(ctx.respond(await self.text(chat.id, "backup-done")), file.unlink())
         return None
